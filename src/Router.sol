@@ -63,6 +63,10 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     mapping(address => mapping(RiskLevel => bool)) public isInDepositList;
     mapping(address => mapping(RiskLevel => bool)) public isInWithdrawList;
 
+    // Claimable amounts: user => RiskLevel => amount
+    mapping(address => mapping(RiskLevel => uint256)) public claimableShares;
+    mapping(address => mapping(RiskLevel => uint256)) public claimableUSDC;
+
     // Batch timing - deposits/withdraws executed setiap X hours
     uint256 public batchInterval = 6 hours;
     mapping(RiskLevel => uint256) public lastBatchTime;
@@ -222,21 +226,16 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         address vaultAddress = vaults[riskLevel];
         require(vaultAddress != address(0), "Vault not set");
 
-        // Check apakah user punya shares yang bisa diclaim
-        uint256 routerShares = IERC20(vaultAddress).balanceOf(address(this));
-        require(routerShares > 0, "No shares to claim");
+        uint256 shares = claimableShares[msg.sender][riskLevel];
+        require(shares > 0, "No shares to claim");
 
-        // Untuk simplicity, kita assume shares didistribusikan proporsional
-        // Dalam production, perlu tracking lebih detail per user
-        // Untuk demo, kita transfer available shares ke user
+        // Reset claimable amount first (reentrancy protection pattern)
+        claimableShares[msg.sender][riskLevel] = 0;
 
-        uint256 userPendingDeposit = pendingDeposits[msg.sender][riskLevel]
-            .amount;
-        require(userPendingDeposit == 0, "Deposit not yet executed");
+        // Transfer shares to user
+        IERC20(vaultAddress).safeTransfer(msg.sender, shares);
 
-        // Note: Ini simplified version
-        // Production perlu proper accounting untuk track shares per user
-        emit DepositClaimed(msg.sender, riskLevel, 0);
+        emit DepositClaimed(msg.sender, riskLevel, shares);
     }
 
     /**
@@ -244,14 +243,16 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
      * @param riskLevel Risk level vault
      */
     function claimWithdrawAssets(RiskLevel riskLevel) external nonReentrant {
-        // Check apakah user punya USDC yang bisa diclaim
-        uint256 userPendingWithdraw = pendingWithdraws[msg.sender][riskLevel]
-            .shares;
-        require(userPendingWithdraw == 0, "Withdraw not yet executed");
+        uint256 amount = claimableUSDC[msg.sender][riskLevel];
+        require(amount > 0, "No USDC to claim");
 
-        // Note: Ini simplified version
-        // Production perlu proper accounting untuk track USDC per user
-        emit WithdrawClaimed(msg.sender, riskLevel, 0);
+        // Reset claimable amount first
+        claimableUSDC[msg.sender][riskLevel] = 0;
+
+        // Transfer USDC to user
+        usdc.safeTransfer(msg.sender, amount);
+
+        emit WithdrawClaimed(msg.sender, riskLevel, amount);
     }
 
     // ============ View Functions ============
@@ -369,8 +370,8 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
             if (userAmount > 0) {
                 uint256 userShares = (sharesMinted * userAmount) / totalAmount;
 
-                // Transfer shares dari Router ke user
-                IERC20(vaultAddress).safeTransfer(user, userShares);
+                // Record claimable shares instead of transferring
+                claimableShares[user][riskLevel] += userShares;
 
                 // Clear pending deposit
                 delete pendingDeposits[user][riskLevel];
@@ -432,8 +433,8 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
             if (userShares > 0) {
                 uint256 userUSDC = (usdcReceived * userShares) / totalShares;
 
-                // Transfer USDC dari Router ke user
-                usdc.safeTransfer(user, userUSDC);
+                // Record claimable USDC instead of transferring
+                claimableUSDC[user][riskLevel] += userUSDC;
 
                 // Clear pending withdraw
                 delete pendingWithdraws[user][riskLevel];
