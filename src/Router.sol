@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./interfaces/IVault.sol";
 
 /**
  * @title Router
@@ -41,7 +42,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     IERC20 public immutable usdc;
 
     // Vault addresses per risk level
-    mapping(RiskLevel => address) public vaults;
+    mapping(RiskLevel => IVault) public vaults;
 
     // Pending deposits: user => RiskLevel => deposit info
     mapping(address => mapping(RiskLevel => UserDeposit))
@@ -58,6 +59,10 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     // List of users dengan pending deposits/withdraws (untuk batch processing)
     mapping(RiskLevel => address[]) public depositUsers;
     mapping(RiskLevel => address[]) public withdrawUsers;
+
+    // Pointers for FIFO processing
+    mapping(RiskLevel => uint256) public depositBatchPointer;
+    mapping(RiskLevel => uint256) public withdrawBatchPointer;
 
     // Track if user sudah di list (untuk avoid duplicates)
     mapping(address => mapping(RiskLevel => bool)) public isInDepositList;
@@ -144,7 +149,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         RiskLevel riskLevel
     ) external nonReentrant whenNotPaused {
         require(amount >= minDepositAmount, "Amount below minimum");
-        require(vaults[riskLevel] != address(0), "Vault not set");
+        require(address(vaults[riskLevel]) != address(0), "Vault not set");
 
         // Transfer USDC from user to Router
         usdc.safeTransferFrom(msg.sender, address(this), amount);
@@ -181,19 +186,15 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         RiskLevel riskLevel
     ) external nonReentrant whenNotPaused {
         require(shares > 0, "Shares must be > 0");
-        address vaultAddress = vaults[riskLevel];
-        require(vaultAddress != address(0), "Vault not set");
+        IVault vault = vaults[riskLevel];
+        require(address(vault) != address(0), "Vault not set");
 
         // Check user has enough shares
-        uint256 userShares = IERC20(vaultAddress).balanceOf(msg.sender);
+        uint256 userShares = vault.balanceOf(msg.sender);
         require(userShares >= shares, "Insufficient shares");
 
         // Transfer shares from user to Router
-        IERC20(vaultAddress).safeTransferFrom(
-            msg.sender,
-            address(this),
-            shares
-        );
+        vault.transferFrom(msg.sender, address(this), shares);
 
         // Update atau add pending withdraw
         if (pendingWithdraws[msg.sender][riskLevel].shares == 0) {
@@ -223,8 +224,8 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
      * @dev Shares sudah di-mint ke Router saat batch, user claim untuk transfer ke wallet
      */
     function claimDepositShares(RiskLevel riskLevel) external nonReentrant {
-        address vaultAddress = vaults[riskLevel];
-        require(vaultAddress != address(0), "Vault not set");
+        IVault vault = vaults[riskLevel];
+        require(address(vault) != address(0), "Vault not set");
 
         uint256 shares = claimableShares[msg.sender][riskLevel];
         require(shares > 0, "No shares to claim");
@@ -233,7 +234,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         claimableShares[msg.sender][riskLevel] = 0;
 
         // Transfer shares to user
-        IERC20(vaultAddress).safeTransfer(msg.sender, shares);
+        vault.transfer(msg.sender, shares);
 
         emit DepositClaimed(msg.sender, riskLevel, shares);
     }
@@ -313,7 +314,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     function getDepositUserCount(
         RiskLevel riskLevel
     ) external view returns (uint256 count) {
-        return depositUsers[riskLevel].length;
+        return depositUsers[riskLevel].length - depositBatchPointer[riskLevel];
     }
 
     /**
@@ -324,7 +325,8 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     function getWithdrawUserCount(
         RiskLevel riskLevel
     ) external view returns (uint256 count) {
-        return withdrawUsers[riskLevel].length;
+        return
+            withdrawUsers[riskLevel].length - withdrawBatchPointer[riskLevel];
     }
 
     // ============ Keeper Functions ============
@@ -339,57 +341,87 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         RiskLevel riskLevel
     ) public nonReentrant whenNotPaused {
         require(isBatchReady(riskLevel), "Batch not ready yet");
-        require(totalPendingDeposits[riskLevel] > 0, "No pending deposits");
+        uint256 pointer = depositBatchPointer[riskLevel];
+        uint256 queueLength = depositUsers[riskLevel].length;
+        require(queueLength > pointer, "No pending deposits");
 
-        address vaultAddress = vaults[riskLevel];
-        require(vaultAddress != address(0), "Vault not set");
+        IVault vault = vaults[riskLevel];
+        require(address(vault) != address(0), "Vault not set");
 
-        uint256 totalAmount = totalPendingDeposits[riskLevel];
-        uint256 userCount = depositUsers[riskLevel].length;
+        uint256 batchSize = 20;
+        uint256 batchAmount = 0;
 
-        // Approve vault to spend USDC
-        usdc.approve(vaultAddress, totalAmount);
+        // Temp array to store users processed in this batch
+        address[] memory batchUsers = new address[](batchSize);
+        uint256 actualUserCount = 0;
 
-        // Call vault's deposit function
-        (bool success, bytes memory returnData) = vaultAddress.call(
-            abi.encodeWithSignature("deposit(uint256)", totalAmount)
-        );
-        require(success, "Vault deposit failed");
+        // Process users FIFO
+        {
+            uint256 processedCount = 0;
+            while (processedCount < batchSize && pointer < queueLength) {
+                address user = depositUsers[riskLevel][pointer];
 
-        // Decode shares minted
-        uint256 sharesMinted = abi.decode(returnData, (uint256));
-        require(sharesMinted > 0, "No shares minted");
+                // Clear storage to refund gas
+                delete depositUsers[riskLevel][pointer];
+                pointer++;
 
-        // Clear pending deposits untuk semua users
-        address[] memory users = depositUsers[riskLevel];
-        for (uint256 i = 0; i < users.length; i++) {
-            address user = users[i];
+                uint256 userAmount = pendingDeposits[user][riskLevel].amount;
 
-            // Transfer shares proporsional ke user
-            uint256 userAmount = pendingDeposits[user][riskLevel].amount;
-            if (userAmount > 0) {
-                uint256 userShares = (sharesMinted * userAmount) / totalAmount;
+                if (userAmount > 0) {
+                    batchAmount += userAmount;
+                    batchUsers[actualUserCount] = user;
+                    actualUserCount++;
+                } else {
+                    isInDepositList[user][riskLevel] = false;
+                }
+                processedCount++;
+            }
+            // Update pointer
+            depositBatchPointer[riskLevel] = pointer;
+        }
 
-                // Record claimable shares instead of transferring
+        if (batchAmount > 0) {
+            // Approve vault to spend USDC
+            usdc.approve(address(vault), batchAmount);
+
+            // Record shares before deposit
+            uint256 sharesBefore = vault.balanceOf(address(this));
+
+            // Call vault's deposit function
+            vault.deposit(batchAmount);
+
+            // Calculate shares minted
+            uint256 sharesAfter = vault.balanceOf(address(this));
+            uint256 sharesMinted = sharesAfter - sharesBefore;
+
+            require(sharesMinted > 0, "No shares minted");
+
+            // Distribute shares
+            for (uint256 i = 0; i < actualUserCount; i++) {
+                address user = batchUsers[i];
+                uint256 userAmount = pendingDeposits[user][riskLevel].amount;
+
+                uint256 userShares = (sharesMinted * userAmount) / batchAmount;
                 claimableShares[user][riskLevel] += userShares;
 
-                // Clear pending deposit
                 delete pendingDeposits[user][riskLevel];
                 isInDepositList[user][riskLevel] = false;
             }
+
+            totalPendingDeposits[riskLevel] -= batchAmount;
         }
 
-        // Reset totals dan lists
-        totalPendingDeposits[riskLevel] = 0;
-        delete depositUsers[riskLevel];
-
-        // Update last batch time
-        lastBatchTime[riskLevel] = block.timestamp;
+        // Reset queue if empty
+        if (depositBatchPointer[riskLevel] == depositUsers[riskLevel].length) {
+            delete depositUsers[riskLevel];
+            depositBatchPointer[riskLevel] = 0;
+            lastBatchTime[riskLevel] = block.timestamp;
+        }
 
         emit BatchDepositsExecuted(
             riskLevel,
-            totalAmount,
-            userCount,
+            batchAmount,
+            actualUserCount,
             block.timestamp
         );
     }
@@ -403,57 +435,87 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         RiskLevel riskLevel
     ) public nonReentrant whenNotPaused {
         require(isBatchReady(riskLevel), "Batch not ready yet");
-        require(totalPendingWithdraws[riskLevel] > 0, "No pending withdraws");
+        uint256 pointer = withdrawBatchPointer[riskLevel];
+        uint256 queueLength = withdrawUsers[riskLevel].length;
+        require(queueLength > pointer, "No pending withdraws");
 
-        address vaultAddress = vaults[riskLevel];
-        require(vaultAddress != address(0), "Vault not set");
+        IVault vault = vaults[riskLevel];
+        require(address(vault) != address(0), "Vault not set");
 
-        uint256 totalShares = totalPendingWithdraws[riskLevel];
-        uint256 userCount = withdrawUsers[riskLevel].length;
+        uint256 batchSize = 20;
+        uint256 batchShares = 0;
 
-        // Approve vault shares (already in Router)
-        IERC20(vaultAddress).approve(vaultAddress, totalShares);
+        // Temp array to store users processed in this batch
+        address[] memory batchUsers = new address[](batchSize);
+        uint256 actualUserCount = 0;
 
-        // Call vault's redeem function
-        (bool success, bytes memory returnData) = vaultAddress.call(
-            abi.encodeWithSignature("redeem(uint256)", totalShares)
-        );
-        require(success, "Vault redeem failed");
+        // Process users FIFO
+        {
+            uint256 processedCount = 0;
+            while (processedCount < batchSize && pointer < queueLength) {
+                address user = withdrawUsers[riskLevel][pointer];
 
-        // Decode USDC received
-        uint256 usdcReceived = abi.decode(returnData, (uint256));
-        require(usdcReceived > 0, "No USDC received");
+                // Clear storage
+                delete withdrawUsers[riskLevel][pointer];
+                pointer++;
 
-        // Distribute USDC proporsional ke users
-        address[] memory users = withdrawUsers[riskLevel];
-        for (uint256 i = 0; i < users.length; i++) {
-            address user = users[i];
+                uint256 userShares = pendingWithdraws[user][riskLevel].shares;
 
-            uint256 userShares = pendingWithdraws[user][riskLevel].shares;
-            if (userShares > 0) {
-                uint256 userUSDC = (usdcReceived * userShares) / totalShares;
+                if (userShares > 0) {
+                    batchShares += userShares;
+                    batchUsers[actualUserCount] = user;
+                    actualUserCount++;
+                } else {
+                    isInWithdrawList[user][riskLevel] = false;
+                }
+                processedCount++;
+            }
+            // Update pointer
+            withdrawBatchPointer[riskLevel] = pointer;
+        }
 
-                // Record claimable USDC instead of transferring
+        if (batchShares > 0) {
+            // Record USDC before redeem
+            uint256 usdcBefore = usdc.balanceOf(address(this));
+
+            // Call vault's redeem function
+            vault.redeem(batchShares);
+
+            // Calculate USDC received
+            uint256 usdcAfter = usdc.balanceOf(address(this));
+            uint256 usdcReceived = usdcAfter - usdcBefore;
+
+            require(usdcReceived > 0, "No USDC received");
+
+            // Distribute USDC proporsional ke users
+            for (uint256 i = 0; i < actualUserCount; i++) {
+                address user = batchUsers[i];
+                uint256 userShares = pendingWithdraws[user][riskLevel].shares;
+
+                uint256 userUSDC = (usdcReceived * userShares) / batchShares;
                 claimableUSDC[user][riskLevel] += userUSDC;
 
-                // Clear pending withdraw
                 delete pendingWithdraws[user][riskLevel];
                 isInWithdrawList[user][riskLevel] = false;
             }
+
+            totalPendingWithdraws[riskLevel] -= batchShares;
         }
 
-        // Reset totals dan lists
-        totalPendingWithdraws[riskLevel] = 0;
-        delete withdrawUsers[riskLevel];
-
-        // Update last batch time
-        lastBatchTime[riskLevel] = block.timestamp;
+        // Reset queue if empty
+        if (
+            withdrawBatchPointer[riskLevel] == withdrawUsers[riskLevel].length
+        ) {
+            delete withdrawUsers[riskLevel];
+            withdrawBatchPointer[riskLevel] = 0;
+            lastBatchTime[riskLevel] = block.timestamp;
+        }
 
         emit BatchWithdrawsExecuted(
             riskLevel,
-            totalShares,
-            usdcReceived,
-            userCount,
+            batchShares,
+            0,
+            actualUserCount,
             block.timestamp
         );
     }
@@ -517,7 +579,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         address vaultAddress
     ) external onlyOwner {
         require(vaultAddress != address(0), "Invalid vault address");
-        vaults[riskLevel] = vaultAddress;
+        vaults[riskLevel] = IVault(vaultAddress);
 
         // Initialize last batch time jika belum di-set
         if (lastBatchTime[riskLevel] == 0) {
@@ -596,7 +658,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Cancel pending deposit (emergency untuk user)
+     * @notice Cancel pending deposit (emergency untuk user) - Admin version
      * @param user User address
      * @param riskLevel Risk level
      * @dev Only owner untuk handle emergency user requests
@@ -620,7 +682,7 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Cancel pending withdraw (emergency untuk user)
+     * @notice Cancel pending withdraw (emergency untuk user) - Admin version
      * @param user User address
      * @param riskLevel Risk level
      * @dev Only owner untuk handle emergency user requests
@@ -632,10 +694,10 @@ contract Router is Ownable, ReentrancyGuard, Pausable {
         uint256 shares = pendingWithdraws[user][riskLevel].shares;
         require(shares > 0, "No pending withdraw");
 
-        address vaultAddress = vaults[riskLevel];
+        IVault vault = vaults[riskLevel];
 
         // Return shares to user
-        IERC20(vaultAddress).safeTransfer(user, shares);
+        vault.transfer(user, shares);
 
         // Update totals
         totalPendingWithdraws[riskLevel] -= shares;
