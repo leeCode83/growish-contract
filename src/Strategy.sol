@@ -18,6 +18,9 @@ contract Strategy is Ownable {
 
     IERC20 public immutable usdc;
     IMockProtocol public immutable protocol;
+    address public immutable conservativeVault;
+    address public immutable balancedVault;
+    address public immutable aggressiveVault;
 
     // ============ Constructor ============
 
@@ -26,11 +29,19 @@ contract Strategy is Ownable {
      * @param _usdc Address of USDC stablecoin contract
      * @param _protocol Address of MockProtocol contract
      */
-    constructor(address _usdc, address _protocol) Ownable(msg.sender) {
+    constructor(address _usdc, address _protocol, address _conservativeVault, address _balancedVault, address _aggressiveVault) Ownable(msg.sender) {
         require(_usdc != address(0), "Invalid USDC address");
         require(_protocol != address(0), "Invalid protocol address");
         usdc = IERC20(_usdc);
         protocol = IMockProtocol(_protocol);
+        conservativeVault = _conservativeVault;
+        balancedVault = _balancedVault;
+        aggressiveVault = _aggressiveVault;
+    }
+
+    modifier onlyVault(){
+        require(msg.sender == conservativeVault || msg.sender == balancedVault || msg.sender == aggressiveVault, "Not authorized");
+        _;
     }
 
     // ============ Core Functions ============
@@ -40,7 +51,7 @@ contract Strategy is Ownable {
      * @param amount Jumlah USDC yang akan di-deposit
      * @dev Hanya bisa dipanggil oleh owner (Vault)
      */
-    function deposit(uint256 amount) external onlyOwner {
+    function deposit(uint256 amount) external onlyVault {
         require(amount > 0, "Amount must be > 0");
 
         // Transfer USDC dari Vault ke Strategy
@@ -58,7 +69,7 @@ contract Strategy is Ownable {
      * @param amount Jumlah USDC yang akan di-withdraw
      * @dev Hanya bisa dipanggil oleh owner (Vault)
      */
-    function withdraw(uint256 amount) external onlyOwner {
+    function withdraw(uint256 amount) external onlyVault {
         require(amount > 0, "Amount must be > 0");
 
         // Withdraw dari Protocol ke Strategy
@@ -73,7 +84,7 @@ contract Strategy is Ownable {
      * @return interest Amount of interest harvested
      * @dev Hanya bisa dipanggil oleh owner (Vault)
      */
-    function harvest() external onlyOwner returns (uint256 interest) {
+    function harvest() external onlyVault returns (uint256 interest) {
         // Get pending interest
         interest = protocol.getPendingInterest(address(this));
 
@@ -92,7 +103,7 @@ contract Strategy is Ownable {
      * @notice Emergency withdraw semua dana dari protocol
      * @dev Hanya bisa dipanggil oleh owner (Vault)
      */
-    function withdrawAll() external onlyOwner {
+    function withdrawAll() external onlyVault {
         uint256 totalBalance = protocol.getSuppliedBalance(address(this));
 
         if (totalBalance > 0) {

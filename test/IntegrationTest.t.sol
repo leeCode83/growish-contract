@@ -40,11 +40,7 @@ contract IntegrationTest is Test {
             1000
         );
 
-        // 2. Deploy Strategies
-        strategyA = new Strategy(address(usdc), address(protocolA));
-        strategyB = new Strategy(address(usdc), address(protocolB));
-
-        // 3. Deploy Vault (Conservative)
+        // 2. Deploy Vault (Conservative)
         // Min rebalance gap 5% (500 bps)
         vault = new Vault(
             "Conservative Vault",
@@ -52,6 +48,23 @@ contract IntegrationTest is Test {
             address(usdc),
             500,
             feeRecipient
+        );
+
+        // 3. Deploy Strategies
+        // Pass vault address for conservative slot, address(0) for others
+        strategyA = new Strategy(
+            address(usdc),
+            address(protocolA),
+            address(vault),
+            address(0),
+            address(0)
+        );
+        strategyB = new Strategy(
+            address(usdc),
+            address(protocolB),
+            address(vault),
+            address(0),
+            address(0)
         );
 
         // 4. Deploy Router
@@ -63,10 +76,6 @@ contract IntegrationTest is Test {
         router.setVault(Router.RiskLevel.Conservative, address(vault));
 
         // Vault adds Strategies
-        // IMPORTANT: Strategy owner must be the Vault for it to call deposit/withdraw
-        strategyA.transferOwnership(address(vault));
-        strategyB.transferOwnership(address(vault));
-
         vault.addStrategy(address(strategyA));
         vault.addStrategy(address(strategyB));
 

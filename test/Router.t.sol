@@ -34,7 +34,7 @@ contract RouterTest is Test {
         ); // 10% APY
 
         // 2. Deploy Strategy
-        strategy = new Strategy(address(usdc), address(protocol));
+        strategy = new Strategy(address(usdc), address(protocol), address(vault), address(0), address(0));
 
         // 3. Deploy Vault
         vault = new Vault(

@@ -65,3 +65,17 @@ Untuk menggunakan yield aggregator ini, user hanya perlu berinteraksi dengan con
     *   `claimWithdrawAssets(riskLevel)`: Mengklaim USDC setelah batch withdraw dieksekusi.
 
 User **TIDAK** perlu berinteraksi langsung dengan Vault, Strategy, atau Protocol. Semua kompleksitas tersebut ditangani oleh Router dan Vault secara otomatis.
+
+## Deployed Contracts (Lisk Sepolia Testnet)
+
+Berikut adalah alamat kontrak yang telah dideploy dan diverifikasi di jaringan Lisk Sepolia Testnet:
+
+*   **MockUSDC**: `0x6f576F9A89555b028ce97581DA6d10e35d433F04`
+*   **Router**: `0x7dC0da00F845A4272C08E51a57651ac004f5e0C7`
+*   **Vault Conservative**: `0x6E69Ed7A9b7F4b1De965328738b3d7Bb757Ea94c`
+*   **Vault Balanced**: `0x21AF332B10481972B903cBd6C3f1ec51546552e7`
+*   **Vault Aggressive**: `0xc4E50772bd6d27661EE12d81e62Daa4882F4E6f4`
+*   **MockProtocol Aave**: `0x53175d08E96a961233ea333385EA74E74C556Cf1`
+*   **MockProtocol Compound**: `0x831f464C241eAa6CcF72F5570c7F5E5f9759317e`
+*   **Strategy Aave**: `0x85A1B6A61C5E73418A40A3a79F6E811Ee848dAa7`
+*   **Strategy Compound**: `0x4B29149492019fE65D0363097728Cab61Cb97F0f`
